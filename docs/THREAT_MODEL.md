@@ -351,15 +351,15 @@ writable data pages and request `MADV_DONTDUMP`. This combines guard-page fault
 isolation with swap/pagefile reduction for dynamic secrets, but all memory-lock
 limits still apply.
 
-On non-Linux Unix targets, explicit exclude and wipe-child fork policies are
-reported as unsupported. An explicit inherit policy succeeds because ordinary
-platform fork behavior inherits the mapping.
-Applications using prefork servers or worker pools must clear secrets before
-forking, isolate secret-owning work into processes created before secrets are
-loaded, or use Linux if `MADV_DONTFORK`-style fork isolation is required.
+On macOS, explicit exclude uses `minherit(..., VM_INHERIT_NONE)` on the
+complete writable region before initialization. Wipe-child remains unsupported.
+Other non-Linux Unix targets report both exclude and wipe-child unsupported.
+An explicit inherit policy succeeds because ordinary platform fork behavior
+inherits the mapping. Applications using prefork servers or worker pools on
+those unsupported targets must clear secrets before forking or isolate
+secret-owning work into processes created before secrets are loaded.
 FreeBSD requests core-dump exclusion with `MADV_NOCORE`; Android, macOS, iOS,
-OpenBSD, NetBSD, and DragonFly BSD currently only lock resident memory and do
-not apply crate-level dump exclusion.
+OpenBSD, NetBSD, and DragonFly BSD do not apply crate-level dump exclusion.
 With `require-fork-exclusion`, named locked constructors request exclusion as
 required and fail on targets where it is unavailable. Explicit requests can
 instead require wipe-child behavior. This feature is intended for deployments
