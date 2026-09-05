@@ -29,7 +29,7 @@ prove that the operating system established a requested protection. For that dis
 | `canary-check` | Adds prefix/suffix integrity canaries to supported mapped storage. Implies `memory-lock`. |
 | `random-canary` | Uses the OS CSPRNG for canary values. Implies `canary-check`. |
 | `strict-canary-check` | Requires OS-random canaries instead of deterministic address-derived canaries. |
-| `require-fork-exclusion` | Requires reviewed fork-inheritance exclusion. Currently Linux-specific. |
+| `require-fork-exclusion` | Requires fork-inheritance exclusion on Linux (`MADV_DONTFORK`) and macOS (`minherit`, `VM_INHERIT_NONE`). |
 
 ## Data-Oblivious And Post-Use Controls
 

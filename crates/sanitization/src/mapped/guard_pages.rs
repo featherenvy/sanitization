@@ -607,7 +607,7 @@ impl GuardedSecretVec {
                 guard_pre_mapping_error(request, capacity, ProtectionControl::Mapping, 0)
             })?;
 
-        let base = match map_guarded(total_len) {
+        let base = match allocate_guarded(total_len) {
             Ok(base) => base,
             Err(error) => {
                 report.mapping = ProtectionState::Failed { code: error.errno };
@@ -650,7 +650,7 @@ impl GuardedSecretVec {
             }
         };
 
-        if let Err(error) = protect_data(data, writable_len) {
+        if let Err(error) = establish_guard_data(data, writable_len) {
             report.guard_pages = ProtectionState::Failed { code: error.errno };
             return Err(guard_required_error(
                 base,
@@ -661,6 +661,14 @@ impl GuardedSecretVec {
             ));
         }
         report.guard_pages = ProtectionState::Established;
+        #[cfg(all(
+            test,
+            feature = "std",
+            feature = "profile-guarded-native",
+            any(target_os = "macos", target_os = "linux"),
+            not(miri)
+        ))]
+        super::native_tests::writable(data.as_ptr(), writable_len);
 
         report.dump_exclusion = apply_guard_control(
             request.dump_exclusion,
@@ -1539,6 +1547,8 @@ impl Drop for GuardedSecretVec {
         self.clear_secret();
         #[cfg(feature = "random-canary")]
         self.clear_canary_material();
+        // clear_secret resets live-owner canaries. Erase those too before release.
+        crate::wipe_backend::erase(self.data.as_ptr(), self.writable_len);
         #[cfg(feature = "memory-lock")]
         if self.locked {
             let _ = unlock_mapping(self.data, self.writable_len);
@@ -2501,6 +2511,23 @@ fn apply_guard_control(
         return Err(guard_required_error(base, total_len, control, 0, *report));
     }
 
+    #[cfg(all(
+        test,
+        feature = "std",
+        feature = "profile-guarded-native",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    let apply = |ptr, len| {
+        if super::native_tests::fail(control) {
+            Err(GuardPageError {
+                operation: GuardPageOperation::DontFork,
+                errno: 0,
+            })
+        } else {
+            apply(ptr, len)
+        }
+    };
     match apply(data, writable_len) {
         Ok(()) => Ok(ProtectionState::Established),
         Err(error) => {
@@ -2609,7 +2636,7 @@ const fn dump_exclusion_supported() -> bool {
 
 #[inline]
 const fn fork_exclusion_supported() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 #[inline]
@@ -2653,6 +2680,19 @@ fn guard_mark_wipeonfork(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageEr
 
 #[cfg(feature = "random-canary")]
 fn random_canary_value() -> Result<crate::canary::CanaryMaterial, GuardPageError> {
+    #[cfg(all(
+        test,
+        feature = "std",
+        feature = "profile-guarded-native",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    if super::native_tests::fail(ProtectionControl::Canary) {
+        return Err(GuardPageError {
+            operation: GuardPageOperation::Random,
+            errno: 0,
+        });
+    }
     crate::canary::CanaryMaterial::random().map_err(|errno| GuardPageError {
         operation: GuardPageOperation::Random,
         errno,
@@ -3235,6 +3275,26 @@ fn mark_dontdump(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
     }
 }
 
+// SDK: sys/mman.h declares int minherit(void *, size_t, int).
+// mach/vm_inherit.h defines VM_INHERIT_NONE as 2 (absent from child).
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn minherit(addr: *mut c_void, len: usize, inherit: c_int) -> c_int;
+}
+
+#[cfg(target_os = "macos")]
+fn mark_dontfork(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
+    const VM_INHERIT_NONE: c_int = 2;
+    // SAFETY: the owning constructor supplies the entire live, page-aligned
+    // writable region, before any caller initializer can run. The SDK ABI
+    // takes size_t (usize), not a truncated 32-bit length.
+    if unsafe { minherit(ptr.as_ptr().cast::<c_void>(), len, VM_INHERIT_NONE) } != 0 {
+        Err(unix_error(GuardPageOperation::DontFork))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn mark_dontfork(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
     let ret = raw_syscall3(SYS_MADVISE, ptr.as_ptr() as usize, len, MADV_DONTFORK);
@@ -3264,7 +3324,7 @@ fn mark_wipeonfork(_ptr: NonNull<u8>, _len: usize) -> Result<(), GuardPageError>
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[inline]
 fn mark_dontfork(_ptr: NonNull<u8>, _len: usize) -> Result<(), GuardPageError> {
     Err(GuardPageError {
@@ -3317,7 +3377,7 @@ fn unlock_mapping(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
 }
 
 #[cfg(target_os = "linux")]
-fn unmap_guarded(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
+fn platform_unmap_guarded(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
     let ret = raw_syscall2(SYS_MUNMAP, ptr.as_ptr() as usize, len);
     if syscall_failed(ret) {
         Err(syscall_error(GuardPageOperation::Unmap, ret))
@@ -3335,7 +3395,7 @@ fn unmap_guarded(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
     target_os = "netbsd",
     target_os = "dragonfly",
 ))]
-fn unmap_guarded(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
+fn platform_unmap_guarded(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
     // SAFETY: `ptr` and `len` describe a live mapping owned by this value.
     let ret = unsafe { munmap(ptr.as_ptr().cast::<c_void>(), len) };
     if ret != 0 {
@@ -3346,7 +3406,7 @@ fn unmap_guarded(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
 }
 
 #[cfg(target_os = "windows")]
-fn unmap_guarded(ptr: NonNull<u8>, _len: usize) -> Result<(), GuardPageError> {
+fn platform_unmap_guarded(ptr: NonNull<u8>, _len: usize) -> Result<(), GuardPageError> {
     // SAFETY: `ptr` points to a region allocated by `VirtualAlloc`.
     let ret = unsafe { VirtualFree(ptr.as_ptr().cast::<c_void>(), 0, MEM_RELEASE) };
     if ret == 0 {
@@ -3438,4 +3498,93 @@ fn raw_syscall6(
     }
 
     ret
+}
+
+fn allocate_guarded(len: usize) -> Result<NonNull<u8>, GuardPageError> {
+    #[cfg(all(
+        test,
+        feature = "std",
+        feature = "profile-guarded-native",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    if super::native_tests::fail(ProtectionControl::Mapping) {
+        return Err(GuardPageError {
+            operation: GuardPageOperation::Map,
+            errno: 0,
+        });
+    }
+    let ptr = map_guarded(len)?;
+    #[cfg(all(
+        test,
+        feature = "std",
+        feature = "profile-guarded-native",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    super::native_tests::mapped(ptr.as_ptr(), len);
+    Ok(ptr)
+}
+
+fn establish_guard_data(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
+    #[cfg(all(
+        test,
+        feature = "std",
+        feature = "profile-guarded-native",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    if super::native_tests::fail(ProtectionControl::GuardPages) {
+        return Err(GuardPageError {
+            operation: GuardPageOperation::Protect,
+            errno: 0,
+        });
+    }
+    protect_data(ptr, len)
+}
+
+fn unmap_guarded(ptr: NonNull<u8>, len: usize) -> Result<(), GuardPageError> {
+    #[cfg(all(
+        test,
+        feature = "std",
+        feature = "profile-guarded-native",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    super::native_tests::before_unmap(ptr.as_ptr());
+    let result = platform_unmap_guarded(ptr, len);
+    #[cfg(all(
+        test,
+        feature = "std",
+        feature = "profile-guarded-native",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    super::native_tests::unmapped(ptr.as_ptr(), result.is_ok());
+    result
+}
+
+#[cfg(all(
+    test,
+    feature = "std",
+    feature = "profile-guarded-native",
+    any(target_os = "macos", target_os = "linux"),
+    not(miri)
+))]
+#[test]
+fn native_guarded_fork_excludes_entire_writable_region() {
+    let mut owner = GuardedSecretVec::with_capacity_with_protection(
+        platform_page_granule() + 1,
+        super::native_tests::request(true),
+    )
+    .expect("native guarded setup");
+    owner.as_mut_capacity_slice().fill(0xa5);
+    assert!(super::native_tests::range_absent_after_fork(
+        owner.data.as_ptr(),
+        owner.writable_len
+    ));
+    assert!(owner
+        .as_mut_capacity_slice()
+        .iter()
+        .all(|byte| *byte == 0xa5));
 }

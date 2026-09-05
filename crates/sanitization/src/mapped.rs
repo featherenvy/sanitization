@@ -1435,3 +1435,14 @@ mod native_ct_guard_page_impls {
         }
     }
 }
+
+#[cfg(all(
+    test,
+    feature = "std",
+    feature = "profile-guarded-native",
+    any(target_os = "macos", target_os = "linux"),
+    not(miri)
+))]
+#[allow(unsafe_code)]
+#[path = "mapped/native_tests.rs"]
+mod native_tests;

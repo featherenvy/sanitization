@@ -440,3 +440,13 @@ same wrapper, including racing consumers. It uses scoped shared exposure and
 clears after return or unwind. It does not defend against a malicious winning
 closure, copies made before construction, process abort, or residual compiler
 and register copies.
+
+## macOS mapping inheritance
+
+On macOS, an established `ForkPolicy::Exclude` uses `VM_INHERIT_NONE` to omit
+the protected writable region from an ordinary fork child. This is distinct
+from copying and then clearing child bytes. It does not establish per-mapping
+core-dump exclusion: that report remains `Unsupported`. Applications requiring
+ordinary process core suppression must establish and verify their own process
+policy before creating private material. No privileged acquisition, suspend,
+hibernation, or kernel-compromise protection is claimed by these controls.
