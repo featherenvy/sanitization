@@ -428,3 +428,141 @@ fn native_fork_oracle_rejects_a_present_zero_mapping() {
         })
         .expect("integrity");
 }
+
+#[test]
+fn native_preferred_control_failures_remain_visible_after_fill() {
+    for control in [ProtectionControl::MemoryLock, ProtectionControl::ForkPolicy] {
+        let probe = Probe::start(Some(control));
+        let mut policy = request(true);
+        policy.memory_lock = Requirement::Preferred;
+        policy.fork.requirement = Requirement::Preferred;
+        let mut calls = 0;
+        let owner = GuardedSecretVec::try_from_capacity_with_protection(31, policy, |bytes| {
+            calls += 1;
+            bytes.fill(0xa5);
+            Ok::<usize, ()>(bytes.len())
+        })
+        .expect("explicit preferred failure returns guarded owner");
+        let report = owner.protection_report();
+        let state = if control == ProtectionControl::MemoryLock {
+            report.memory_lock
+        } else {
+            report.fork.state
+        };
+        assert!(matches!(state, ProtectionState::Failed { .. }));
+        assert_eq!(report.guard_pages, ProtectionState::Established);
+        assert_eq!(report.canary, ProtectionState::Established);
+        assert_eq!(calls, 1);
+        drop(owner);
+        probe.check(1, 1);
+    }
+}
+
+#[test]
+fn native_compact_and_large_boundary_accounting() {
+    // Denominator: four sequential guarded strict-policy allocations per native
+    // lane, straddling Jury's 1 MiB compact and 16 MiB large public boundaries.
+    // Countermetric: refusals; this is behavior/cleanup evidence, not an SLO.
+    for requested in [
+        1024 * 1024,
+        1024 * 1024 + 1,
+        16 * 1024 * 1024,
+        16 * 1024 * 1024 + 1,
+    ] {
+        let probe = Probe::start(None);
+        let mut called = false;
+        let result = GuardedSecretVec::try_from_capacity_with_protection(
+            requested,
+            request(true),
+            |bytes| {
+                called = true;
+                bytes.fill(0xa5);
+                Ok::<usize, ()>(bytes.len())
+            },
+        );
+        let (outcome, report) = match result {
+            Ok(owner) => {
+                assert!(called);
+                let report = *owner.protection_report();
+                assert_eq!(
+                    report.locked_bytes,
+                    report.mapped_bytes - 2 * report.page_granule
+                );
+                drop(owner);
+                ("accepted", report)
+            }
+            Err(ProtectedSecretFillError::Protection(error)) => {
+                assert!(!called);
+                assert_eq!(
+                    error.failure.control,
+                    ProtectionControl::MemoryLock,
+                    "only native lock budget may refuse this case"
+                );
+                assert_eq!(error.rollback.unmap, RollbackState::Completed);
+                ("refused", error.partial_report)
+            }
+            Err(_) => panic!("unexpected boundary construction failure"),
+        };
+        probe.check(1, 1);
+        std::println!("M01_PROVIDER_BOUNDARY requested={} mapped={} locked={} page_granule={} outcome={} cleanup=completed", requested, report.mapped_bytes, report.locked_bytes, report.page_granule, outcome);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_zero_lock_budget_refuses_before_fill() {
+    use std::process::{Command, Stdio};
+    const CASE: &str = "mapped::native_tests::native_zero_lock_budget_refuses_before_fill";
+    if std::env::var("SANITIZATION_LOCK_TEST_CHILD").as_deref() != Ok("1") {
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", CASE, "--nocapture"])
+            .env("SANITIZATION_LOCK_TEST_CHILD", "1")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("lock-budget subprocess");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success());
+                    return;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("lock-budget subprocess failed or timed out");
+                }
+            }
+        }
+    }
+    unsafe extern "C" {
+        fn setrlimit(resource: c_int, limits: *const u64) -> c_int;
+    }
+    // Linux x86_64/aarch64 SDK ABI: two unsigned-long limits, RLIMIT_MEMLOCK=8.
+    // SAFETY: limits points to both initialized fields; only this child is changed.
+    assert_eq!(unsafe { setrlimit(8, [0u64, 0].as_ptr()) }, 0);
+    for guarded in [true, false] {
+        let probe = Probe::start(None);
+        let mut called = false;
+        let fill = |_: &mut [u8]| {
+            called = true;
+            Ok::<usize, ()>(1)
+        };
+        let result = if guarded {
+            GuardedSecretVec::try_from_capacity_with_protection(31, request(true), fill).map(drop)
+        } else {
+            LockedSecretVec::try_from_capacity_with_protection(31, request(false), fill).map(drop)
+        };
+        let Err(ProtectedSecretFillError::Protection(error)) = result else {
+            panic!("expected native lock refusal");
+        };
+        assert_eq!(error.failure.control, ProtectionControl::MemoryLock);
+        assert_eq!(error.rollback.unmap, RollbackState::Completed);
+        assert!(!called);
+        probe.check(1, 1);
+    }
+}
